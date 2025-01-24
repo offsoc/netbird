@@ -339,7 +339,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			t.Logf("Internal rule: %v", rule)
 
 			// Check if the rule exists in iptables
-			exists, err := iptablesClient.Exists(tableFilter, chainRTFWD, rule...)
+			exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, rule...)
 			assert.NoError(t, err, "Failed to check rule existence")
 			assert.True(t, exists, "Rule not found in iptables")
 
