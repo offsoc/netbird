@@ -27,10 +27,15 @@ import (
 const (
 	chainNameRoutingFw  = "netbird-rt-fwd"
 	chainNameRoutingNat = "netbird-rt-postrouting"
+	chainNameRoutingRdr = "netbird-rt-redirect"
 	chainNameForward    = "FORWARD"
 
 	userDataAcceptForwardRuleIif = "frwacceptiif"
 	userDataAcceptForwardRuleOif = "frwacceptoif"
+
+	dnatSuffix = "_dnat"
+	snatSuffix = "_snat"
+	fwdSuffix  = "_fwd"
 )
 
 const refreshRulesMapError = "refresh rules map: %w"
@@ -133,14 +138,22 @@ func (r *router) createContainers() error {
 		Type:     nftables.ChainTypeNAT,
 	})
 
+	r.chains[chainNameRoutingRdr] = r.conn.AddChain(&nftables.Chain{
+		Name:     chainNameRoutingRdr,
+		Table:    r.workTable,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityNATDest,
+		Type:     nftables.ChainTypeNAT,
+	})
+
 	// Chain is created by acl manager
 	// TODO: move creation to a common place
 	r.chains[chainNamePrerouting] = &nftables.Chain{
 		Name:     chainNamePrerouting,
 		Table:    r.workTable,
-		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookPrerouting,
 		Priority: nftables.ChainPriorityMangle,
+		Type:     nftables.ChainTypeFilter,
 	}
 
 	// Add the single NAT rule that matches on mark
@@ -887,6 +900,169 @@ func (r *router) refreshRulesMap() error {
 			}
 		}
 	}
+	return nil
+}
+
+func (r *router) AddDNATRule(rule firewall.ForwardRule) (firewall.Rule, error) {
+	ruleKey := rule.GetRuleID()
+	if _, exists := r.rules[ruleKey+dnatSuffix]; exists {
+		return rule, nil
+	}
+
+	protoNum, err := protoToInt(rule.Protocol)
+	if err != nil {
+		return nil, fmt.Errorf("convert protocol to number: %w", err)
+	}
+
+	dnatExprs := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     ifname(r.wgIface.Name()),
+		},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{protoNum},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       2,
+			Len:          2,
+		},
+	}
+
+	dnatExprs = append(dnatExprs, applyPort(&rule.DestinationPort, false)...)
+
+	dnatExprs = append(dnatExprs,
+		&expr.Immediate{
+			Register: 1,
+			Data:     rule.TranslatedAddress.AsSlice(),
+		},
+	)
+
+	var regProtoMin, regProtoMax uint32
+	switch {
+	case len(rule.TranslatedPort.Values) == 0:
+		// no translated port, use original port
+	case rule.TranslatedPort.IsRange && len(rule.TranslatedPort.Values) == 2:
+		dnatExprs = append(dnatExprs,
+			&expr.Immediate{
+				Register: 2,
+				Data:     binaryutil.BigEndian.PutUint16(uint16(rule.TranslatedPort.Values[0])),
+			},
+			&expr.Immediate{
+				Register: 3,
+				Data:     binaryutil.BigEndian.PutUint16(uint16(rule.TranslatedPort.Values[1])),
+			},
+		)
+		regProtoMin = 2
+		regProtoMax = 3
+	case len(rule.TranslatedPort.Values) == 1:
+		dnatExprs = append(dnatExprs,
+			&expr.Immediate{
+				Register: 2,
+				Data:     binaryutil.BigEndian.PutUint16(uint16(rule.TranslatedPort.Values[0])),
+			},
+		)
+		regProtoMin = 2
+	default:
+		return nil, fmt.Errorf("invalid translated port: %v", rule.TranslatedPort)
+	}
+
+	dnatExprs = append(dnatExprs,
+		&expr.NAT{
+			Type:        expr.NATTypeDestNAT,
+			Family:      uint32(nftables.TableFamilyIPv4),
+			RegAddrMin:  1,
+			RegProtoMin: regProtoMin,
+			RegProtoMax: regProtoMax,
+		},
+	)
+
+	dnatRule := &nftables.Rule{
+		Table:    r.workTable,
+		Chain:    r.chains[chainNameRoutingRdr],
+		Exprs:    dnatExprs,
+		UserData: []byte(ruleKey + dnatSuffix),
+	}
+	r.conn.AddRule(dnatRule)
+	r.rules[ruleKey+dnatSuffix] = dnatRule
+
+	// Masquerade rule in postrouting
+	masqExprs := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     ifname(r.wgIface.Name()),
+		},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{protoNum},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseNetworkHeader,
+			Offset:       16,
+			Len:          4,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     rule.TranslatedAddress.AsSlice(),
+		},
+	}
+
+	masqExprs = append(masqExprs, applyPort(&rule.TranslatedPort, false)...)
+	masqExprs = append(masqExprs, &expr.Masq{})
+
+	masqRule := &nftables.Rule{
+		Table:    r.workTable,
+		Chain:    r.chains[chainNameRoutingNat],
+		Exprs:    masqExprs,
+		UserData: []byte(ruleKey + snatSuffix),
+	}
+	r.conn.AddRule(masqRule)
+	r.rules[ruleKey+snatSuffix] = masqRule
+
+	if err := r.conn.Flush(); err != nil {
+		return nil, fmt.Errorf("flush rules: %w", err)
+	}
+
+	return rule, nil
+}
+
+func (r *router) DeleteDNATRule(rule firewall.Rule) error {
+	ruleKey := rule.GetRuleID()
+
+	if err := r.refreshRulesMap(); err != nil {
+		return fmt.Errorf(refreshRulesMapError, err)
+	}
+
+	if dnatRule, exists := r.rules[ruleKey+dnatSuffix]; exists {
+		if err := r.conn.DelRule(dnatRule); err != nil {
+			return fmt.Errorf("delete DNAT rule: %w", err)
+		}
+		delete(r.rules, ruleKey+dnatSuffix)
+	}
+
+	if masqRule, exists := r.rules[ruleKey+snatSuffix]; exists {
+		if err := r.conn.DelRule(masqRule); err != nil {
+			return fmt.Errorf("delete masquerade rule: %w", err)
+		}
+		delete(r.rules, ruleKey+snatSuffix)
+	}
+
+	if err := r.conn.Flush(); err != nil {
+		return fmt.Errorf("flush rules: %w", err)
+	}
+
 	return nil
 }
 
